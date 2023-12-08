@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+#
+# Manage daily dump files, like those from a database.
+#
+
+import sys, os, glob, re
+import datetime
+import logging
+import argparse
+import errno
+
+verbosity_to_log_level = [ logging.CRITICAL, logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG ]
+
+default_filename_pattern = '*'
+default_retain_count = '10:6:12:999'
+default_periods = '7:30:365'
+
+timestamp_regex = re.compile(r'([0-9]{4})[_-]?([0-9]{2})[_-]?([0-9]{2})([_-]?([0-9]{2})[_:-]?([0-9]{2})([_:-]?([0-9]{2}))?)?')
+
+cli_parser = argparse.ArgumentParser(description='Manage temporal collections of daily dump files')
+cli_parser.add_argument('-v', '--verbose',
+    dest='verbosity',
+    action='count',
+    default=2,
+    help='Increase amount of information displayed as the program executes')
+cli_parser.add_argument('-q', '--quiet',
+    dest='quietness',
+    action='count',
+    default=0,
+    help='Decrease amount of information displayed as the program executes')
+cli_parser.add_argument('-d', '--dry-run',
+    dest='is_dryrun',
+    action='store_true',
+    default=False,
+    help='Do not remove any files, just determine what would be removed')
+cli_parser.add_argument('--demo-mode', metavar='<n-iters>',
+    dest='demo_mode',
+    default=None,
+    help='Generate and process this many files in the provided directory using this program')
+cli_parser.add_argument('-t', '--filename-pattern', metavar='<glob-pattern>',
+    dest='filename_pattern',
+    default=default_filename_pattern,
+    help='Consider filenames in the directories matching this pattern (default: {:s})'.format(default_filename_pattern))
+cli_parser.add_argument('-p', '--periods', metavar='<days-in-week>:<days-in-month>:<days-in-year>',
+    dest='periods',
+    default=default_periods,
+    help='The number of days in a week, month, and year (default: {:s})'.format(default_periods))
+cli_parser.add_argument('-r', '--retention', metavar='<daily>:<weekly>:<monthly>:<yearly>',
+    dest='retention',
+    default=default_retain_count,
+    help='Retention policy is colon-separated list of daily, weekly, monthly, and yearly counts (default: {:s})'.format(default_retain_count))
+cli_parser.add_argument('directories', metavar='<path>',
+    nargs='+',
+    help='Dump directory to process')
+
+# Parse command-line arguments:
+cli_args = cli_parser.parse_args()
+
+# Get logging setup:
+verbosity_idx = max(0, min(cli_args.verbosity - cli_args.quietness, len(verbosity_to_log_level) - 1))
+logging.basicConfig(level=verbosity_to_log_level[verbosity_idx])
+logging.debug('Arguments collected:')
+for cli_arg, cli_arg_value in cli_args.__dict__.items():
+    logging.debug('    {:s} => {:s}'.format(cli_arg, str(cli_arg_value)))
+
+# Parse the periods:
+try:
+    periods = [int(s) for s in cli_args.periods.split(':')]
+except:
+    logging.error('Periods list is invalid: {:s}'.format(cli_args.periods))
+    sys.exit(errno.EINVAL)
+if len(periods) != 3:
+    logging.error('Periods list requires 3 values, not {:d}'.format(len(periods)))
+    sys.exit(errno.EINVAL)
+if periods[1] <= periods[0] or periods[2] <= periods[1]:
+    logging.error('Invalid periods list (decreasing day count): {:s}'.format(cli_args.periods))
+    sys.exit(errno.EINVAL)
+if periods[1] / periods[0] < 2:
+    logging.error('Invalid periods list (days-in-month must be at least 2 x days-in-week = {:d})'.format(periods[0] * 2))
+    sys.exit(errno.EINVAL)
+if periods[2] / periods[1] < 2:
+    logging.error('Invalid periods list (days-in-year must be at least 2 x days-in-month = {:d})'.format(periods[1] * 2))
+    sys.exit(errno.EINVAL)
+dt_year = datetime.timedelta(days=periods[2])
+dt_month = datetime.timedelta(days=periods[1])
+dt_week = datetime.timedelta(days=periods[0])
+
+# Parse the retention policy:
+try:
+    retention = [int(s) for s in cli_args.retention.split(':')]
+except:
+    logging.error('Retention policy is invalid: {:s}'.format(cli_args.retention))
+    sys.exit(errno.EINVAL)
+if len(retention) != 4:
+    logging.error('Retention policy requires 4 values, not {:d}'.format(len(retention)))
+    sys.exit(errno.EINVAL)
+if min(retention) < 0:
+    logging.error('Retention policy requires values >= 0')
+    sys.exit(errno.EINVAL)
+if retention[0] < periods[0]:
+    logging.error('Invalid retention policy (must keep at least {:d} dailies to sync with days-in-week)'.format(periods[0]))
+    sys.exit(errno.EINVAL)
+
+# Summarize policy:
+logging.info('    Period definitions:')
+logging.info('        - {:d} days = year'.format(periods[2]))
+logging.info('        - {:d} days = month'.format(periods[1]))
+logging.info('        - {:d} days = week'.format(periods[0]))
+logging.info('    Retention policy of:')
+logging.info('        - {:d} yearly'.format(retention[3]))
+logging.info('        - {:d} monthly'.format(retention[2]))
+logging.info('        - {:d} weekly'.format(retention[1]))
+logging.info('        - {:d} daily'.format(retention[0]))
+
+# Function that processes a dump directory:
+def process_directory(cli_args, dumpdir, origin_date=datetime.datetime.now()):
+    file_matches = {}
+    found_timestamps = []
+    logging.info('Scanning directory {:s}'.format(dumpdir))
+    for fname in glob.iglob(os.path.join(dumpdir, cli_args.filename_pattern)):
+        # Isolate the timestamp embedded in the filename:
+        timestamp = timestamp_regex.search(os.path.basename(fname))
+        if timestamp is not None:
+            # Parse-out timestamp fields and create a datetime representation:
+            (year, month, day, hour, minute, second) = [(int(timestamp.group(i)) if timestamp.group(i) else 0) for i in (1, 2, 3, 5, 6, 8)]
+            fdate = datetime.datetime(year, month, day, hour, minute, second)
+            
+            if fdate in file_matches:
+                logging.warning('    Omitting file {:s} for duplicate timestamp {:s}'.format(fname, str(fdate)))
+            else:
+                file_matches[fdate] = fname
+                found_timestamps.append(fdate)
+                logging.info('    Found file {:s} for timestamp {:s}'.format(fname, str(fdate)))
+    
+    def check_timestamp(then, now, dt):
+        if then is None:
+            return True
+        if (now - then) >= dt:
+            return True
+        return False
+    
+    # Choose keepers:
+    daily = []
+    weekly = []
+    monthly = []
+    yearly = []
+    
+    # We start with the full (sorted) list of timestamps:
+    all_timestamps = sorted(found_timestamps, reverse=True)
+    
+    # The first N_daily files are our dailies:
+    if len(all_timestamps) <= retention[0]:
+        daily = all_timestamps
+        all_timestamps = []
+    else:
+        daily = all_timestamps[:retention[0]]
+        all_timestamps = all_timestamps[retention[0]:]
+    
+    # Filter the remainder in reverse order to retain only those that are a week apart:
+    last_timestamp = None
+    for timestamp in reversed(all_timestamps):
+        if check_timestamp(last_timestamp, timestamp, dt_week):
+            weekly.insert(0, timestamp)
+            last_timestamp = timestamp
+    # The first N_weekly files are our weeklies:
+    if len(weekly) <= retention[1]:
+        all_timestamps = []
+    else:
+        all_timestamps = weekly[retention[1]:]
+        weekly = weekly[:retention[1]]
+    
+    # Filter the remainder in reverse order to retain only those that are a month apart:
+    last_timestamp = None
+    for timestamp in reversed(all_timestamps):
+        if check_timestamp(last_timestamp, timestamp, dt_month):
+            monthly.insert(0, timestamp)
+            last_timestamp = timestamp
+    # The first N_monthly files are our monthlies:
+    if len(monthly) <= retention[2]:
+        all_timestamps = []
+    else:
+        all_timestamps = monthly[retention[2]:]
+        monthly = monthly[:retention[2]]
+    
+    # Filter the remainder in reverse order to retain only those that are a year apart:
+    last_timestamp = None
+    for timestamp in reversed(all_timestamps):
+        if check_timestamp(last_timestamp, timestamp, dt_year):
+            yearly.insert(0, timestamp)
+            last_timestamp = timestamp
+    # The first N_yearly files are our yearlies:
+    if len(yearly) > retention[3]:
+        yearly = yearly[:retention[3]]
+    
+    # What should we get rid of?
+    keep = set(daily + weekly + monthly + yearly)
+    purge = set(found_timestamps) - keep
+    
+    logging.info('    Will retain:')
+    for timestamp in sorted(keep):
+        if timestamp in daily:
+            whence = 'daily'
+        elif timestamp in weekly:
+            whence = 'weekly'
+        elif timestamp in monthly:
+            whence = 'monthly'
+        elif timestamp in yearly:
+            whence = 'yearly'
+        logging.info('        [{:7s}] {:s} => {:s} '.format(whence, str(timestamp), file_matches[timestamp]))
+    logging.info('    Will purge:')
+    for timestamp in sorted(purge):
+        logging.info('                  {:s} => {:s} '.format(str(timestamp), file_matches[timestamp]))
+    
+    # Final action:
+    for timestamp in purge:
+        if cli_args.is_dryrun:
+            print(file_matches[timestamp])
+        else:
+            try:
+                os.remove(file_matches[timestamp])
+            except Exception as e:
+                logging.error('Unable to remove {:s}: {:s}'.format(file_matches[timestamp], str(e)))
+
+
+if cli_args.demo_mode is not None:
+    try:
+        iter_limit = int(cli_args.demo_mode)
+    except:
+        logging.error('Invalid demo mode iteration count: {:s}'.format(cli_args.demo_mode))
+        sys.exit(errno.EINVAL)
+    dumpdir = cli_args.directories[0]
+    timestamp = datetime.datetime(1977, 3, 25, 4, 30)
+    while iter_limit > 0:
+        fname = os.path.join(dumpdir, 'db-hpc-{:04d}{:02d}{:02d}-{:02d}{:02d}.txt'.format(timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute))
+        with open(fname, 'w') as fptr:
+            fptr.close()
+        
+        # Now do the processing:
+        process_directory(cli_args, dumpdir, origin_date=timestamp)
+        
+        timestamp = timestamp + datetime.timedelta(days=1)
+        iter_limit -= 1
+else:
+    for dumpdir in cli_args.directories:
+        if not os.path.isdir(dumpdir):
+            logging.critical('No such directory: {:s}'.format(dumpdir))
+            sys.exit(1)
+        process_directory(cli_args, dumpdir)
